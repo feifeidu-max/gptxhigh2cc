@@ -75,7 +75,7 @@ scripts/windows/
 ### 手动直接启动
 
 ```powershell
-$env:OPENAI_API_KEY="<YOUR_OPENAI_API_KEY>"
+$env:OPENAI_API_KEY="<sk-mH6XI234JuYtCpizT4zXRyLE3U8z9yahHnyx0FzhN4PebrId>"
 $env:OPENAI_MODEL="gpt-5.4"
 $env:OPENAI_REASONING_EFFORT="xhigh"
 python .\src\cc2open_gateway.py
@@ -227,3 +227,4 @@ http://127.0.0.1:8787
 ```text
 Ctrl + C
 ```
+

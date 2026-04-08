@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import errno
 import socket
 import sys
 import threading
@@ -38,6 +39,11 @@ DEFAULT_TIMEOUT_SECONDS = 600
 DEFAULT_STREAM_PING_INTERVAL = 5
 DEFAULT_STREAM_IDLE_TIMEOUT = 15
 SERVER_NAME = "cc2open-gateway"
+CLIENT_DISCONNECT_WINERRORS = {10053, 10054}
+
+
+class ClientDisconnectedError(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -555,9 +561,162 @@ def maybe_set_stream_timeout(response: Any, timeout_seconds: int) -> None:
             continue
 
 
+DEBUG_OUTPUT_LOCK = threading.Lock()
+
+
 def debug_log(config: Config, message: str) -> None:
     if config.debug:
-        print(f"[cc2open-debug] {message}", flush=True)
+        with DEBUG_OUTPUT_LOCK:
+            print(f"[cc2open-debug] {message}", file=sys.stderr, flush=True)
+
+
+def is_client_disconnect_error(exc: BaseException) -> bool:
+    if isinstance(exc, ClientDisconnectedError):
+        return True
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        return True
+    if isinstance(exc, OSError):
+        if getattr(exc, "winerror", None) in CLIENT_DISCONNECT_WINERRORS:
+            return True
+        if getattr(exc, "errno", None) in {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED}:
+            return True
+    return False
+
+
+def stream_debug_log(config: Config, stream_pet: StreamingDebugPet | None, message: str) -> None:
+    if stream_pet is not None:
+        stream_pet.pause_for_log()
+    debug_log(config, message)
+
+
+class StreamingDebugPet:
+    DANCING_FRAMES = ("(~^.^)~", "~(^.^~)", "\\(^.^)/", "/(^.^)\\")
+    SLEEPING_FRAMES = ("( -.-)zZ", "( -.-)Zz")
+    ACTIVE_SECONDS = 0.7
+    RENDER_INTERVAL_SECONDS = 0.2
+    SUMMARY_INTERVAL_SECONDS = 5.0
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.enabled = config.debug
+        self.stream = sys.stderr
+        self.interactive = self.enabled and self.stream.isatty()
+        self.line_count = 0
+        self.byte_count = 0
+        self._frame_index = 0
+        self._last_activity = 0.0
+        self._last_render = 0.0
+        self._last_summary = 0.0
+        self._max_line_length = 0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._finished = False
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        if self.interactive:
+            self._render(time.monotonic(), force=True)
+            self._thread = threading.Thread(
+                target=self._render_loop,
+                name="cc2open-debug-pet",
+                daemon=True,
+            )
+            self._thread.start()
+        else:
+            debug_log(self.config, "upstream stream pet: ( -.-)zZ waiting for upstream response")
+
+    def update(self, raw_line: bytes) -> None:
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+        with self._lock:
+            self.line_count += 1
+            self.byte_count += len(raw_line)
+            self._last_activity = now
+            line_count = self.line_count
+            byte_count = self.byte_count
+
+        if self.interactive:
+            self._render(now)
+        elif now - self._last_summary >= self.SUMMARY_INTERVAL_SECONDS:
+            self._last_summary = now
+            debug_log(
+                self.config,
+                f"upstream stream pet: (~^.^)~ receiving lines={line_count} bytes={byte_count}",
+            )
+
+    def finish(self) -> None:
+        if not self.enabled or self._finished:
+            return
+
+        self._finished = True
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+        with self._lock:
+            max_line_length = self._max_line_length
+            line_count = self.line_count
+            byte_count = self.byte_count
+            self._max_line_length = 0
+
+        if self.interactive:
+            if max_line_length:
+                with DEBUG_OUTPUT_LOCK:
+                    self.stream.write("\r" + (" " * max_line_length) + "\r")
+                    self.stream.flush()
+        elif line_count:
+            debug_log(
+                self.config,
+                f"upstream stream pet summary: lines={line_count} bytes={byte_count}",
+            )
+
+    def pause_for_log(self) -> None:
+        if not self.interactive or self._finished:
+            return
+
+        with self._lock:
+            max_line_length = self._max_line_length
+
+        if max_line_length:
+            with DEBUG_OUTPUT_LOCK:
+                self.stream.write("\r" + (" " * max_line_length) + "\r")
+                self.stream.flush()
+
+    def _render_loop(self) -> None:
+        while not self._stop_event.wait(self.RENDER_INTERVAL_SECONDS):
+            self._render(time.monotonic(), force=True)
+
+    def _render(self, now: float, force: bool = False) -> None:
+        if not self.interactive:
+            return
+
+        with self._lock:
+            if not force and now - self._last_render < self.RENDER_INTERVAL_SECONDS:
+                return
+
+            self._last_render = now
+            is_dancing = (
+                self.line_count > 0
+                and now - self._last_activity <= self.ACTIVE_SECONDS
+            )
+            frames = self.DANCING_FRAMES if is_dancing else self.SLEEPING_FRAMES
+            pet = frames[self._frame_index % len(frames)]
+            self._frame_index += 1
+            action = "收到响应中" if is_dancing else "等待上游响应"
+            line = (
+                f"[cc2open-debug] {pet} {action}... "
+                f"lines={self.line_count} bytes={self.byte_count}"
+            )
+            padding = max(0, self._max_line_length - len(line))
+            self._max_line_length = max(self._max_line_length, len(line))
+
+        with DEBUG_OUTPUT_LOCK:
+            self.stream.write("\r" + line + (" " * padding))
+            self.stream.flush()
 
 
 class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
@@ -573,6 +732,25 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
             "%s - - [%s] %s\n"
             % (self.address_string(), self.log_date_time_string(), fmt % args)
         )
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except Exception as exc:
+            if is_client_disconnect_error(exc):
+                debug_log(self.config, f"client disconnected during request handling: {exc}")
+                self.close_connection = True
+                return
+            raise
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        except Exception as exc:
+            if is_client_disconnect_error(exc):
+                debug_log(self.config, f"client disconnected during response flush: {exc}")
+                return
+            raise
 
     def setup(self) -> None:
         super().setup()
@@ -652,8 +830,22 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
 
             self.send_anthropic_error_response(404, f"Unknown path: {self.path}")
         except Exception as exc:  # pragma: no cover - final safety net
+            if is_client_disconnect_error(exc):
+                debug_log(self.config, f"client disconnected during POST handling: {exc}")
+                self.close_connection = True
+                return
             traceback.print_exc()
-            self.send_anthropic_error_response(500, f"Internal server error: {exc}")
+            try:
+                self.send_anthropic_error_response(500, f"Internal server error: {exc}")
+            except Exception as send_exc:
+                if is_client_disconnect_error(send_exc):
+                    debug_log(
+                        self.config,
+                        f"client disconnected before 500 error could be sent: {send_exc}",
+                    )
+                    self.close_connection = True
+                    return
+                raise
 
     def handle_count_tokens(self) -> None:
         body = self.read_json_body()
@@ -717,10 +909,15 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
 
                 def send_sse(event: str, data: dict[str, Any], flush: bool = True) -> None:
                     payload = sse_encode(event, data)
-                    with write_lock:
-                        self.wfile.write(payload)
-                        if flush:
-                            self.wfile.flush()
+                    try:
+                        with write_lock:
+                            self.wfile.write(payload)
+                            if flush:
+                                self.wfile.flush()
+                    except Exception as exc:
+                        if is_client_disconnect_error(exc):
+                            raise ClientDisconnectedError(str(exc)) from exc
+                        raise
 
                 def ping_loop() -> None:
                     interval = max(1, self.config.stream_ping_interval)
@@ -737,6 +934,8 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                     daemon=True,
                 )
                 ping_thread.start()
+                stream_pet = StreamingDebugPet(self.config)
+                stream_pet.start()
 
                 try:
                     message_id = gen_message_id()
@@ -775,15 +974,16 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
 
                     try:
                         for raw_line in response:
-                            debug_log(
-                                self.config,
-                                f"upstream raw line: {raw_line!r}",
-                            )
+                            stream_pet.update(raw_line)
                             sse_data = extract_sse_data_lines(raw_line)
                             if sse_data is None:
                                 continue
                             if sse_data == "[DONE]":
-                                debug_log(self.config, "received upstream [DONE]")
+                                stream_debug_log(
+                                    self.config,
+                                    stream_pet,
+                                    "received upstream [DONE]",
+                                )
                                 should_finalize = True
                                 break
 
@@ -807,8 +1007,9 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                                 if choice.get("finish_reason"):
                                     finish_reason = choice.get("finish_reason")
                                     should_finalize = True
-                                    debug_log(
+                                    stream_debug_log(
                                         self.config,
+                                        stream_pet,
                                         f"finish_reason detected: {finish_reason}",
                                     )
 
@@ -895,15 +1096,20 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                                         )
 
                             if should_finalize:
-                                debug_log(self.config, "finalizing stream because finish_reason arrived")
+                                stream_debug_log(
+                                    self.config,
+                                    stream_pet,
+                                    "finalizing stream because finish_reason arrived",
+                                )
                                 break
                     except socket.timeout:
                         timed_out_waiting_for_upstream = True
                         should_finalize = True
                         if not finish_reason:
                             finish_reason = "stop"
-                        debug_log(
+                        stream_debug_log(
                             self.config,
+                            stream_pet,
                             f"upstream stream idle for {self.config.stream_idle_timeout}s; forcing finalize",
                         )
 
@@ -945,17 +1151,25 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                             "type": "message_stop",
                         },
                     )
-                    debug_log(self.config, "sent message_stop to client")
+                    stream_debug_log(self.config, stream_pet, "sent message_stop to client")
                     if timed_out_waiting_for_upstream:
-                        debug_log(self.config, "stream ended via idle-timeout fallback")
+                        stream_debug_log(
+                            self.config,
+                            stream_pet,
+                            "stream ended via idle-timeout fallback",
+                        )
                     self.close_connection = True
                     _ = input_tokens
                 finally:
                     stop_pings.set()
+                    stream_pet.finish()
                     ping_thread.join(timeout=1)
         except urllib.error.HTTPError as exc:
             body_bytes = exc.read()
             self.proxy_upstream_error(exc.code, body_bytes)
+        except ClientDisconnectedError as exc:
+            debug_log(self.config, f"stream client disconnected: {exc}")
+            self.close_connection = True
         except urllib.error.URLError as exc:
             self.send_anthropic_error_response(
                 502,
@@ -1015,19 +1229,29 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
 
     def send_json_response(self, status_code: int, payload: dict[str, Any]) -> None:
         body = json_dumps(payload)
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if is_client_disconnect_error(exc):
+                raise ClientDisconnectedError(str(exc)) from exc
+            raise
 
     def send_anthropic_error_response(self, status_code: int, message: str) -> None:
         self.send_json_response(status_code, anthropic_error(message))
 
 
+class GracefulThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def main() -> int:
     config = parse_args()
-    server = ThreadingHTTPServer((config.host, config.port), ClaudeToOpenAIHandler)
+    server = GracefulThreadingHTTPServer((config.host, config.port), ClaudeToOpenAIHandler)
     server.config = config  # type: ignore[attr-defined]
 
     print(
