@@ -5,12 +5,13 @@ param(
     [string]$ReasoningEffort = "xhigh",
     [int]$Port = 8787,
     [int]$StreamPingInterval = 5,
-    [int]$StreamIdleTimeout = 60,
-    [string]$Debug = "0"
+    [int]$StreamIdleTimeout = 300,
+    [string]$Debug = "1"
 )
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$gatewayScript = Join-Path $scriptDir "cc2open_gateway.py"
+$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\.."))
+$gatewayScript = Join-Path $repoRoot "src\cc2open_gateway.py"
 
 if (-not (Test-Path $gatewayScript)) {
     Write-Error "Gateway script not found: $gatewayScript"

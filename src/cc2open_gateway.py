@@ -777,7 +777,7 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                         for raw_line in response:
                             debug_log(
                                 self.config,
-                                f"upstream raw line: {raw_line[:200]!r}",
+                                f"upstream raw line: {raw_line!r}",
                             )
                             sse_data = extract_sse_data_lines(raw_line)
                             if sse_data is None:

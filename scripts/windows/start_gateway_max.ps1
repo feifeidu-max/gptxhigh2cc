@@ -19,4 +19,6 @@ if (-not (Test-Path $starter)) {
     -Model $Model `
     -ReasoningEffort "xhigh" `
     -Port $Port `
-    -StreamPingInterval 5
+    -StreamPingInterval 5 `
+    -StreamIdleTimeout 300 `
+    -Debug "1"

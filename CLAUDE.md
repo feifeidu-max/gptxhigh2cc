@@ -10,29 +10,27 @@ This repo is a minimal local gateway that accepts Anthropic/Claude-style `POST /
 
 ### Run the gateway directly
 
-Set the required environment variables, then start the server:
-
 ```powershell
 $env:OPENAI_API_KEY="<YOUR_OPENAI_API_KEY>"
 $env:OPENAI_MODEL="gpt-5.4"
 $env:OPENAI_REASONING_EFFORT="xhigh"
-python D:\Ai\cc2open\cc2open_gateway.py
+python .\src\cc2open_gateway.py
 ```
 
 ### Run via preset launcher scripts
 
-These wrappers all start `start_gateway.ps1`, set the model/base URL defaults, and only vary `reasoning_effort` plus stream ping interval:
+These wrappers all start `scripts/windows/start_gateway.ps1`, set the model/base URL defaults, and only vary `reasoning_effort` plus stream settings:
 
 ```powershell
-D:\Ai\cc2open\start_gateway_fast.cmd
-D:\Ai\cc2open\start_gateway_balanced.cmd
-D:\Ai\cc2open\start_gateway_max.cmd
+.\scripts\windows\start_gateway_fast.cmd
+.\scripts\windows\start_gateway_balanced.cmd
+.\scripts\windows\start_gateway_max.cmd
 ```
 
 ### Show CLI options
 
 ```powershell
-python D:\Ai\cc2open\cc2open_gateway.py --help
+python .\src\cc2open_gateway.py --help
 ```
 
 ### Syntax check
@@ -40,7 +38,7 @@ python D:\Ai\cc2open\cc2open_gateway.py --help
 There is no formal build/lint/test setup in this repo. The closest lightweight verification is Python bytecode compilation:
 
 ```powershell
-python -m py_compile D:\Ai\cc2open\cc2open_gateway.py
+python -m py_compile .\src\cc2open_gateway.py
 ```
 
 ### Health check
@@ -74,7 +72,7 @@ Invoke-RestMethod `
 
 ### Main executable
 
-- `cc2open_gateway.py` is the whole application: CLI parsing, config, Anthropic↔OpenAI payload translation, HTTP routing, upstream proxying, and SSE streaming.
+- `src/cc2open_gateway.py` is the whole application: CLI parsing, config, Anthropic↔OpenAI payload translation, HTTP routing, upstream proxying, and SSE streaming.
 - `main()` builds a `ThreadingHTTPServer` and serves a single `BaseHTTPRequestHandler` subclass.
 
 ### Configuration model
@@ -146,6 +144,6 @@ A background ping thread keeps the client stream alive. There is also an idle-ti
 
 ## Launcher scripts
 
-- `start_gateway.ps1` is the canonical launcher. It prompts for `OPENAI_API_KEY` if needed, exports env vars, prints the chosen config, and runs `python -S cc2open_gateway.py`.
-- `start_gateway_fast.ps1`, `start_gateway_balanced.ps1`, and `start_gateway_max.ps1` are thin presets over `start_gateway.ps1`.
-- The `.cmd` files are only Windows shims that invoke the matching PowerShell scripts.
+- `scripts/windows/start_gateway.ps1` is the canonical launcher. It prompts for `OPENAI_API_KEY` if needed, exports env vars, prints the chosen config, and runs `python -S src/cc2open_gateway.py`.
+- `scripts/windows/start_gateway_fast.ps1`, `scripts/windows/start_gateway_balanced.ps1`, and `scripts/windows/start_gateway_max.ps1` are thin presets over `scripts/windows/start_gateway.ps1`.
+- The `.cmd` files are Windows shims that invoke the matching PowerShell scripts.

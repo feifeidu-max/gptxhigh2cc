@@ -17,6 +17,8 @@ if (-not (Test-Path $starter)) {
     -ApiKey $ApiKey `
     -BaseUrl $BaseUrl `
     -Model $Model `
-    -ReasoningEffort "high" `
+    -ReasoningEffort "medium" `
     -Port $Port `
-    -StreamPingInterval 4
+    -StreamPingInterval 3 `
+    -StreamIdleTimeout 300 `
+    -Debug "1"
