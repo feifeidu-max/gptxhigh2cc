@@ -226,6 +226,8 @@ def anthropic_text_from_content(content: Any) -> str:
         for item in content:
             if isinstance(item, dict):
                 item_type = item.get("type")
+                if item_type == "thinking":
+                    continue
                 if item_type == "text":
                     parts.append(str(item.get("text", "")))
                 elif item_type == "tool_result":
@@ -245,6 +247,87 @@ def anthropic_text_from_content(content: Any) -> str:
 def flatten_system_prompt(system_value: Any) -> str | None:
     text = anthropic_text_from_content(system_value).strip()
     return text or None
+
+
+def _extract_reasoning_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("thinking", "reasoning", "reasoning_content", "text", "content"):
+            text = _extract_reasoning_text(value.get(key))
+            if text:
+                return text
+        return ""
+    if isinstance(value, list):
+        parts = [_extract_reasoning_text(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def extract_openai_reasoning_block(message: dict[str, Any]) -> dict[str, str] | None:
+    thinking_parts: list[str] = []
+    signature = ""
+
+    for key in ("reasoning_content", "reasoning"):
+        text = _extract_reasoning_text(message.get(key))
+        if text:
+            thinking_parts.append(text)
+        value = message.get(key)
+        if isinstance(value, dict) and value.get("signature") and not signature:
+            signature = str(value["signature"])
+
+    content = message.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type in {"reasoning", "reasoning_content", "thinking"}:
+                text = _extract_reasoning_text(item)
+                if text:
+                    thinking_parts.append(text)
+                if item.get("signature") and not signature:
+                    signature = str(item["signature"])
+
+    thinking_text = "\n".join(part for part in thinking_parts if part).strip()
+    if not thinking_text and not signature:
+        return None
+
+    block = {"thinking": thinking_text}
+    if signature:
+        block["signature"] = signature
+    return block
+
+
+def iter_openai_reasoning_deltas(delta: dict[str, Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+
+    for key in ("reasoning_content", "reasoning"):
+        value = delta.get(key)
+        text = _extract_reasoning_text(value)
+        if text:
+            out.append({"thinking": text})
+        if isinstance(value, dict) and value.get("signature"):
+            out.append({"signature": str(value["signature"])})
+
+    content = delta.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type not in {"reasoning", "reasoning_content", "thinking"}:
+                continue
+            text = _extract_reasoning_text(item)
+            if text:
+                out.append({"thinking": text})
+            if item.get("signature"):
+                out.append({"signature": str(item["signature"])})
+
+    if delta.get("reasoning_signature"):
+        out.append({"signature": str(delta["reasoning_signature"])})
+
+    return out
 
 
 def build_openai_tools(anthropic_tools: Any) -> list[dict[str, Any]] | None:
@@ -335,6 +418,8 @@ def anthropic_messages_to_openai(
                 if not isinstance(block, dict):
                     continue
                 block_type = block.get("type")
+                if block_type == "thinking":
+                    continue
                 if block_type == "text":
                     text = str(block.get("text", ""))
                     if text:
@@ -476,6 +561,16 @@ def parse_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
 
 def openai_content_to_anthropic_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
+
+    reasoning_block = extract_openai_reasoning_block(message)
+    if reasoning_block is not None:
+        thinking_block: dict[str, Any] = {
+            "type": "thinking",
+            "thinking": reasoning_block.get("thinking", ""),
+        }
+        if reasoning_block.get("signature"):
+            thinking_block["signature"] = reasoning_block["signature"]
+        blocks.append(thinking_block)
 
     content = message.get("content")
     if isinstance(content, str) and content:
@@ -1171,6 +1266,9 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
 
                     text_block_started = False
                     text_block_index: int | None = None
+                    thinking_block_started = False
+                    thinking_block_index: int | None = None
+                    thinking_signature = ""
                     next_content_index = 0
                     tool_blocks: dict[int, dict[str, Any]] = {}
 
@@ -1241,6 +1339,45 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                                         stream_pet,
                                         f"finish_reason detected: {finish_reason}",
                                     )
+
+                                for reasoning_delta in iter_openai_reasoning_deltas(delta):
+                                    thinking_text = reasoning_delta.get("thinking", "")
+                                    signature = reasoning_delta.get("signature", "")
+                                    if not thinking_text and not signature:
+                                        continue
+
+                                    saw_any_output = saw_any_output or bool(thinking_text)
+                                    if not thinking_block_started:
+                                        thinking_block_index = next_content_index
+                                        send_sse(
+                                            "content_block_start",
+                                            {
+                                                "type": "content_block_start",
+                                                "index": thinking_block_index,
+                                                "content_block": {
+                                                    "type": "thinking",
+                                                    "thinking": "",
+                                                },
+                                            },
+                                        )
+                                        thinking_block_started = True
+                                        next_content_index += 1
+
+                                    if thinking_text:
+                                        send_sse(
+                                            "content_block_delta",
+                                            {
+                                                "type": "content_block_delta",
+                                                "index": thinking_block_index,
+                                                "delta": {
+                                                    "type": "thinking_delta",
+                                                    "thinking": thinking_text,
+                                                },
+                                            },
+                                        )
+
+                                    if signature:
+                                        thinking_signature = signature
 
                                 text_delta = delta.get("content")
                                 if isinstance(text_delta, str) and text_delta:
@@ -1339,6 +1476,27 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                                 if finish_reason_seen
                                 else f"upstream stream idle for {self.config.stream_idle_timeout}s; forcing finalize"
                             ),
+                        )
+
+                    if thinking_block_started:
+                        if thinking_signature:
+                            send_sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": thinking_block_index,
+                                    "delta": {
+                                        "type": "signature_delta",
+                                        "signature": thinking_signature,
+                                    },
+                                },
+                            )
+                        send_sse(
+                            "content_block_stop",
+                            {
+                                "type": "content_block_stop",
+                                "index": thinking_block_index,
+                            },
                         )
 
                     if text_block_started:
