@@ -38,6 +38,7 @@ DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_TIMEOUT_SECONDS = 600
 DEFAULT_STREAM_PING_INTERVAL = 5
 DEFAULT_STREAM_IDLE_TIMEOUT = 15
+DEFAULT_POST_FINISH_GRACE_TIMEOUT = 5
 SERVER_NAME = "cc2open-gateway"
 CLIENT_DISCONNECT_WINERRORS = {10053, 10054}
 
@@ -58,6 +59,7 @@ class Config:
     timeout_seconds: int
     stream_ping_interval: int
     stream_idle_timeout: int
+    post_finish_grace_timeout: int
     debug: bool
 
     @property
@@ -138,6 +140,17 @@ def parse_args() -> Config:
         help="Finalize stream if upstream stays idle for N seconds after output starts. Default: 15",
     )
     parser.add_argument(
+        "--post-finish-grace-timeout",
+        type=int,
+        default=int(
+            env_or_default(
+                "CC2OPEN_POST_FINISH_GRACE_TIMEOUT",
+                str(DEFAULT_POST_FINISH_GRACE_TIMEOUT),
+            )
+        ),
+        help="After finish_reason arrives, wait up to N more seconds for trailing chunks/[DONE]. Default: 5",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=(env_or_default("CC2OPEN_DEBUG", "0") == "1"),
@@ -160,6 +173,7 @@ def parse_args() -> Config:
         timeout_seconds=args.timeout_seconds,
         stream_ping_interval=args.stream_ping_interval,
         stream_idle_timeout=args.stream_idle_timeout,
+        post_finish_grace_timeout=args.post_finish_grace_timeout,
         debug=args.debug,
     )
 
@@ -944,6 +958,7 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                     output_tokens = 0
                     finish_reason: str | None = None
                     should_finalize = False
+                    finish_reason_seen = False
                     saw_any_output = False
                     timed_out_waiting_for_upstream = False
 
@@ -1006,7 +1021,12 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                                 delta = choice.get("delta") or {}
                                 if choice.get("finish_reason"):
                                     finish_reason = choice.get("finish_reason")
-                                    should_finalize = True
+                                    if not finish_reason_seen:
+                                        finish_reason_seen = True
+                                        maybe_set_stream_timeout(
+                                            response,
+                                            max(1, self.config.post_finish_grace_timeout),
+                                        )
                                     stream_debug_log(
                                         self.config,
                                         stream_pet,
@@ -1095,13 +1115,6 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                                             },
                                         )
 
-                            if should_finalize:
-                                stream_debug_log(
-                                    self.config,
-                                    stream_pet,
-                                    "finalizing stream because finish_reason arrived",
-                                )
-                                break
                     except socket.timeout:
                         timed_out_waiting_for_upstream = True
                         should_finalize = True
@@ -1110,7 +1123,12 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                         stream_debug_log(
                             self.config,
                             stream_pet,
-                            f"upstream stream idle for {self.config.stream_idle_timeout}s; forcing finalize",
+                            (
+                                f"upstream post-finish grace timeout reached "
+                                f"({self.config.post_finish_grace_timeout}s); forcing finalize"
+                                if finish_reason_seen
+                                else f"upstream stream idle for {self.config.stream_idle_timeout}s; forcing finalize"
+                            ),
                         )
 
                     if text_block_started:
