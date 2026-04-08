@@ -330,7 +330,94 @@ def iter_openai_reasoning_deltas(delta: dict[str, Any]) -> list[dict[str, str]]:
     return out
 
 
-def build_openai_tools(anthropic_tools: Any) -> list[dict[str, Any]] | None:
+FALLBACK_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "websearch": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query",
+            },
+            "allowed_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only include results from these domains.",
+            },
+            "blocked_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Exclude results from these domains.",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+    "webfetch": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "URL to fetch.",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Prompt describing what to extract from the fetched content.",
+            },
+        },
+        "required": ["url", "prompt"],
+        "additionalProperties": False,
+    },
+}
+
+
+def normalize_openai_function_schema(
+    tool_name: str,
+    input_schema: Any,
+) -> tuple[dict[str, Any] | None, str]:
+    normalized_name = tool_name.replace("_", "").lower()
+    fallback_schema = FALLBACK_TOOL_SCHEMAS.get(normalized_name)
+
+    if not isinstance(input_schema, dict):
+        if fallback_schema is not None:
+            return json.loads(json.dumps(fallback_schema)), "fallback_missing_schema"
+        return None, "skip_invalid_schema"
+
+    schema = dict(input_schema)
+    if "type" not in schema:
+        schema["type"] = "object"
+
+    if schema.get("type") != "object":
+        return None, "skip_non_object_schema"
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        if fallback_schema is not None:
+            return json.loads(json.dumps(fallback_schema)), "fallback_missing_properties"
+        return None, "skip_missing_properties"
+
+    normalized_properties = {
+        str(key): value for key, value in properties.items() if isinstance(value, dict)
+    }
+    if not normalized_properties:
+        if fallback_schema is not None:
+            return json.loads(json.dumps(fallback_schema)), "fallback_invalid_properties"
+        return None, "skip_invalid_properties"
+
+    schema["properties"] = normalized_properties
+    required = schema.get("required")
+    if isinstance(required, list):
+        valid_property_names = set(normalized_properties)
+        schema["required"] = [
+            str(item) for item in required if isinstance(item, str) and item in valid_property_names
+        ]
+
+    return schema, "preserved"
+
+
+def build_openai_tools(
+    config: Config,
+    anthropic_tools: Any,
+) -> list[dict[str, Any]] | None:
     if not isinstance(anthropic_tools, list) or not anthropic_tools:
         return None
 
@@ -338,17 +425,59 @@ def build_openai_tools(anthropic_tools: Any) -> list[dict[str, Any]] | None:
     for tool in anthropic_tools:
         if not isinstance(tool, dict) or not tool.get("name"):
             continue
+        tool_name = str(tool["name"])
+        input_schema = tool.get("input_schema")
+        debug_log(
+            config,
+            "incoming tool "
+            f"{tool_name}: has_input_schema={isinstance(input_schema, dict)}",
+        )
+        parameters, schema_status = normalize_openai_function_schema(tool_name, input_schema)
+        if parameters is None:
+            debug_log(
+                config,
+                f"skipping tool {tool_name}: schema_status={schema_status}",
+            )
+            continue
+        debug_log(
+            config,
+            f"forwarding tool {tool_name}: schema_status={schema_status}",
+        )
         tools.append(
             {
                 "type": "function",
                 "function": {
-                    "name": tool["name"],
+                    "name": tool_name,
                     "description": tool.get("description", ""),
-                    "parameters": tool.get("input_schema", {"type": "object"}),
+                    "parameters": parameters,
                 },
             }
         )
     return tools or None
+
+
+def summarize_openai_tools_for_debug(openai_body: dict[str, Any]) -> str:
+    summarized_tools: list[dict[str, Any]] = []
+    for tool in openai_body.get("tools", []) or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        parameters = function.get("parameters")
+        summary: dict[str, Any] = {
+            "name": function.get("name"),
+            "parameter_type": parameters.get("type") if isinstance(parameters, dict) else None,
+        }
+        if isinstance(parameters, dict):
+            properties = parameters.get("properties")
+            if isinstance(properties, dict):
+                summary["properties"] = sorted(str(key) for key in properties.keys())
+            required = parameters.get("required")
+            if isinstance(required, list):
+                summary["required"] = [item for item in required if isinstance(item, str)]
+        summarized_tools.append(summary)
+    return json.dumps(summarized_tools, ensure_ascii=False, separators=(",", ":"))
 
 
 def map_tool_choice(value: Any) -> Any:
@@ -510,7 +639,7 @@ def build_openai_request(config: Config, body: dict[str, Any]) -> dict[str, Any]
     if isinstance(max_tokens, int):
         openai_body["max_completion_tokens"] = max_tokens
 
-    tools = build_openai_tools(body.get("tools"))
+    tools = build_openai_tools(config, body.get("tools"))
     if tools:
         openai_body["tools"] = tools
 
@@ -1182,7 +1311,7 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
 
         upstream_status, upstream_headers, upstream_bytes = self.call_openai(openai_body)
         if upstream_status >= 400:
-            self.proxy_upstream_error(upstream_status, upstream_bytes)
+            self.proxy_upstream_error(upstream_status, upstream_bytes, openai_body)
             return
 
         _ = upstream_headers
@@ -1553,7 +1682,7 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                     ping_thread.join(timeout=1)
         except urllib.error.HTTPError as exc:
             body_bytes = exc.read()
-            self.proxy_upstream_error(exc.code, body_bytes)
+            self.proxy_upstream_error(exc.code, body_bytes, openai_body)
         except ClientDisconnectedError as exc:
             debug_log(self.config, f"stream client disconnected: {exc}")
             self.close_connection = True
@@ -1563,7 +1692,12 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                 f"Failed to reach upstream OpenAI endpoint: {exc}",
             )
 
-    def proxy_upstream_error(self, status_code: int, body_bytes: bytes) -> None:
+    def proxy_upstream_error(
+        self,
+        status_code: int,
+        body_bytes: bytes,
+        openai_body: dict[str, Any] | None = None,
+    ) -> None:
         try:
             upstream_json = safe_json_loads(body_bytes)
         except Exception:
@@ -1578,6 +1712,14 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
             if isinstance(upstream_json, dict)
             else None
         ) or "Upstream request failed"
+
+        if openai_body is not None:
+            debug_log(
+                self.config,
+                f"upstream {status_code} for model={openai_body.get('model')} "
+                f"tools={summarize_openai_tools_for_debug(openai_body)} "
+                f"message={message}",
+            )
 
         self.send_anthropic_error_response(status_code, message)
 
