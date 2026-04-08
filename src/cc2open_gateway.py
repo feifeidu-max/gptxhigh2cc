@@ -61,6 +61,7 @@ class Config:
     stream_idle_timeout: int
     post_finish_grace_timeout: int
     debug: bool
+    debug_pet: str
 
     @property
     def upstream_url(self) -> str:
@@ -156,6 +157,12 @@ def parse_args() -> Config:
         default=(env_or_default("CC2OPEN_DEBUG", "0") == "1"),
         help="Enable verbose debug logs for streaming and upstream requests.",
     )
+    parser.add_argument(
+        "--debug-pet",
+        choices=("auto", "0", "1"),
+        default=env_or_default("CC2OPEN_DEBUG_PET", "auto"),
+        help="Enable terminal pet UI: auto, 0, or 1. Default: auto",
+    )
 
     args = parser.parse_args()
 
@@ -175,6 +182,7 @@ def parse_args() -> Config:
         stream_idle_timeout=args.stream_idle_timeout,
         post_finish_grace_timeout=args.post_finish_grace_timeout,
         debug=args.debug,
+        debug_pet=args.debug_pet,
     )
 
 
@@ -601,27 +609,105 @@ def stream_debug_log(config: Config, stream_pet: StreamingDebugPet | None, messa
     if stream_pet is not None:
         stream_pet.pause_for_log()
     debug_log(config, message)
+    if stream_pet is not None:
+        stream_pet.resume_after_log()
+
+
+@dataclass
+class StreamingDebugStatus:
+    state: str = "daydream"
+    line_count: int = 0
+    byte_count: int = 0
+    bubble: str = "等你发消息"
+    last_event: str = ""
+    last_activity_at: float = 0.0
 
 
 class StreamingDebugPet:
-    DANCING_FRAMES = ("(~^.^)~", "~(^.^~)", "\\(^.^)/", "/(^.^)\\")
-    SLEEPING_FRAMES = ("( -.-)zZ", "( -.-)Zz")
+    BOX_WIDTH = 38
+    BOX_HEIGHT = 8
+    BOX_TOP = 1
     ACTIVE_SECONDS = 0.7
-    RENDER_INTERVAL_SECONDS = 0.2
+    SLEEP_AFTER_SECONDS = 6.0
+    RENDER_INTERVAL_SECONDS = 0.25
     SUMMARY_INTERVAL_SECONDS = 5.0
+    BOX_FRAMES: dict[str, tuple[tuple[str, ...], ...]] = {
+        "daydream": (
+            (
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "     |·  ·|     ",
+                "     |____|     ",
+            ),
+            (
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "     |·  ·|     ",
+                "     |__﹏|     ",
+            ),
+        ),
+        "sleeping": (
+            (
+                "      ,>        ",
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "     |-  -|  zZ ",
+            ),
+            (
+                "      ,>        ",
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "     |-  -|  Zz ",
+            ),
+        ),
+        "excited": (
+            (
+                "    \\ .-. /    ",
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "    \\|^  ^|/    ",
+            ),
+            (
+                "    / .-. \\    ",
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "    /|^  ^|\\    ",
+            ),
+        ),
+        "dancing": (
+            (
+                "    \\ .-. /    ",
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "   \\_|^  ^|_/   ",
+            ),
+            (
+                "    / .-. \\    ",
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "   /_|^  ^|_\\   ",
+            ),
+            (
+                "     .-.-.      ",
+                "   .-o-OO-o-.   ",
+                "  (__________)  ",
+                "    \\|^  ^|/    ",
+            ),
+        ),
+    }
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.enabled = config.debug
+        self.status = StreamingDebugStatus(last_activity_at=time.monotonic())
         self.stream = sys.stderr
+        self.enabled = bool(config.debug) and config.debug_pet != "0"
+        self.mode = config.debug_pet
         self.interactive = self.enabled and self.stream.isatty()
-        self.line_count = 0
-        self.byte_count = 0
+        self.multiline = self.interactive and self._supports_fixed_box()
         self._frame_index = 0
-        self._last_activity = 0.0
         self._last_render = 0.0
         self._last_summary = 0.0
-        self._max_line_length = 0
+        self._rendered = False
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -630,7 +716,7 @@ class StreamingDebugPet:
     def start(self) -> None:
         if not self.enabled:
             return
-        if self.interactive:
+        if self.multiline:
             self._render(time.monotonic(), force=True)
             self._thread = threading.Thread(
                 target=self._render_loop,
@@ -638,99 +724,219 @@ class StreamingDebugPet:
                 daemon=True,
             )
             self._thread.start()
+        elif self.interactive:
+            self._render_single_line(time.monotonic(), force=True)
+            self._thread = threading.Thread(
+                target=self._render_loop,
+                name="cc2open-debug-pet",
+                daemon=True,
+            )
+            self._thread.start()
         else:
-            debug_log(self.config, "upstream stream pet: ( -.-)zZ waiting for upstream response")
+            debug_log(self.config, "pet ui disabled in non-interactive terminal")
 
-    def update(self, raw_line: bytes) -> None:
-        if not self.enabled:
-            return
+    def record_waiting(self) -> None:
+        self._set_state("daydream", "等你发消息")
 
+    def record_activity(self, raw_line: bytes) -> None:
         now = time.monotonic()
         with self._lock:
-            self.line_count += 1
-            self.byte_count += len(raw_line)
-            self._last_activity = now
-            line_count = self.line_count
-            byte_count = self.byte_count
+            self.status.line_count += 1
+            self.status.byte_count += len(raw_line)
+            self.status.last_activity_at = now
+            if self.status.line_count == 1:
+                self.status.state = "excited"
+                self.status.bubble = "我在收流啦"
+            else:
+                self.status.state = "dancing"
+                self.status.bubble = "继续收流中"
+        self._trigger_render(now)
 
-        if self.interactive:
-            self._render(now)
-        elif now - self._last_summary >= self.SUMMARY_INTERVAL_SECONDS:
-            self._last_summary = now
-            debug_log(
-                self.config,
-                f"upstream stream pet: (~^.^)~ receiving lines={line_count} bytes={byte_count}",
-            )
+    def record_done(self) -> None:
+        self._set_state("daydream", "这次收完啦")
+
+    def record_finish_reason(self, finish_reason: str) -> None:
+        self._set_state("excited", f"收尾中：{finish_reason}")
+
+    def record_timeout(self) -> None:
+        self._set_state("sleeping", "上游有点慢，我守着")
+
+    def record_message_stop(self) -> None:
+        self._set_state("daydream", "等你下一条消息")
 
     def finish(self) -> None:
         if not self.enabled or self._finished:
             return
-
         self._finished = True
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=1)
-
-        with self._lock:
-            max_line_length = self._max_line_length
-            line_count = self.line_count
-            byte_count = self.byte_count
-            self._max_line_length = 0
-
-        if self.interactive:
-            if max_line_length:
-                with DEBUG_OUTPUT_LOCK:
-                    self.stream.write("\r" + (" " * max_line_length) + "\r")
-                    self.stream.flush()
-        elif line_count:
+        if self.multiline:
+            self.record_message_stop()
+            self._render(time.monotonic(), force=True)
+        elif self.interactive:
+            self._clear_rendered_block()
+        elif self.status.line_count:
             debug_log(
                 self.config,
-                f"upstream stream pet summary: lines={line_count} bytes={byte_count}",
+                f"upstream stream pet summary: lines={self.status.line_count} bytes={self.status.byte_count}",
             )
 
     def pause_for_log(self) -> None:
-        if not self.interactive or self._finished:
+        if self._finished:
             return
+        if not self.multiline:
+            self._clear_rendered_block()
 
+    def resume_after_log(self) -> None:
+        if self._finished or not self.enabled:
+            return
+        if not self.multiline:
+            self._trigger_render(time.monotonic(), force=True)
+
+    def _set_state(self, state: str, bubble: str) -> None:
         with self._lock:
-            max_line_length = self._max_line_length
+            self.status.state = state
+            self.status.bubble = bubble
+            self.status.last_activity_at = time.monotonic()
+        self._trigger_render(time.monotonic(), force=True)
 
-        if max_line_length:
-            with DEBUG_OUTPUT_LOCK:
-                self.stream.write("\r" + (" " * max_line_length) + "\r")
-                self.stream.flush()
+    def _supports_fixed_box(self) -> bool:
+        if not self.interactive:
+            return False
+        size = self._get_terminal_size()
+        if size is None or size.columns < self.BOX_WIDTH + 2 or size.lines < self.BOX_HEIGHT:
+            return False
+        term = (os.environ.get("TERM") or "").lower()
+        term_program = (os.environ.get("TERM_PROGRAM") or "").lower()
+        if self.mode == "1":
+            return True
+        if os.name != "nt":
+            return term != "dumb"
+        return bool(
+            os.environ.get("WT_SESSION")
+            or os.environ.get("ANSICON")
+            or os.environ.get("ConEmuANSI") == "ON"
+            or term_program == "vscode"
+            or any(token in term for token in ("xterm", "vt100", "cygwin", "msys"))
+        )
+
+    def _get_terminal_size(self) -> os.terminal_size | None:
+        try:
+            return os.get_terminal_size(self.stream.fileno())
+        except OSError:
+            return None
 
     def _render_loop(self) -> None:
         while not self._stop_event.wait(self.RENDER_INTERVAL_SECONDS):
-            self._render(time.monotonic(), force=True)
+            self._trigger_render(time.monotonic(), force=True)
+
+    def _trigger_render(self, now: float, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        if self.multiline:
+            self._render(now, force=force)
+        elif self.interactive:
+            self._render_single_line(now, force=force)
+        elif now - self._last_summary >= self.SUMMARY_INTERVAL_SECONDS:
+            self._last_summary = now
+            debug_log(
+                self.config,
+                f"pet state={self._effective_state(now)} lines={self.status.line_count} bytes={self.status.byte_count}",
+            )
+
+    def _effective_state(self, now: float) -> str:
+        with self._lock:
+            state = self.status.state
+            last_activity_at = self.status.last_activity_at
+        if state in {"excited", "dancing"} and now - last_activity_at > self.ACTIVE_SECONDS:
+            return "sleeping" if now - last_activity_at > self.SLEEP_AFTER_SECONDS else "daydream"
+        if state == "daydream" and now - last_activity_at > self.SLEEP_AFTER_SECONDS:
+            return "sleeping"
+        return state
+
+    def _top_right_origin(self) -> tuple[int, int] | None:
+        size = self._get_terminal_size()
+        if size is None or size.columns < self.BOX_WIDTH or size.lines < self.BOX_HEIGHT:
+            return None
+        col = max(1, size.columns - self.BOX_WIDTH + 1)
+        return self.BOX_TOP, col
 
     def _render(self, now: float, force: bool = False) -> None:
+        if not self.multiline:
+            return
+        if not force and now - self._last_render < self.RENDER_INTERVAL_SECONDS:
+            return
+        origin = self._top_right_origin()
+        if origin is None:
+            self.multiline = False
+            self._rendered = False
+            return
+        self._last_render = now
+        state = self._effective_state(now)
+        with self._lock:
+            bubble = self.status.bubble
+            lines = self.status.line_count
+            bytes_count = self.status.byte_count
+        frame = self.BOX_FRAMES[state][self._frame_index % len(self.BOX_FRAMES[state])]
+        self._frame_index += 1
+        bubble_line = f"气泡：{bubble}"[: self.BOX_WIDTH - 4]
+        info_line = f"状态：{state}  lines={lines}  bytes={bytes_count}"[: self.BOX_WIDTH - 4]
+        box_lines = [
+            "┌" + ("─" * (self.BOX_WIDTH - 2)) + "┐",
+            "│ " + bubble_line.ljust(self.BOX_WIDTH - 4) + " │",
+            *[
+                "│ " + part.ljust(self.BOX_WIDTH - 4) + " │"
+                for part in frame
+            ],
+            "│ " + info_line.ljust(self.BOX_WIDTH - 4) + " │",
+            "└" + ("─" * (self.BOX_WIDTH - 2)) + "┘",
+        ]
+        row, col = origin
+        with DEBUG_OUTPUT_LOCK:
+            self.stream.write("\x1b[s")
+            for index, line in enumerate(box_lines):
+                self.stream.write(f"\x1b[{row + index};{col}H{line[: self.BOX_WIDTH].ljust(self.BOX_WIDTH)}")
+            self.stream.write("\x1b[u")
+            self.stream.flush()
+            self._rendered = True
+
+    def _render_single_line(self, now: float, force: bool = False) -> None:
         if not self.interactive:
             return
-
+        if not force and now - self._last_render < self.RENDER_INTERVAL_SECONDS:
+            return
+        self._last_render = now
+        state = self._effective_state(now)
         with self._lock:
-            if not force and now - self._last_render < self.RENDER_INTERVAL_SECONDS:
-                return
-
-            self._last_render = now
-            is_dancing = (
-                self.line_count > 0
-                and now - self._last_activity <= self.ACTIVE_SECONDS
-            )
-            frames = self.DANCING_FRAMES if is_dancing else self.SLEEPING_FRAMES
-            pet = frames[self._frame_index % len(frames)]
-            self._frame_index += 1
-            action = "收到响应中" if is_dancing else "等待上游响应"
-            line = (
-                f"[cc2open-debug] {pet} {action}... "
-                f"lines={self.line_count} bytes={self.byte_count}"
-            )
-            padding = max(0, self._max_line_length - len(line))
-            self._max_line_length = max(self._max_line_length, len(line))
-
+            bubble = self.status.bubble
+            lines = self.status.line_count
+            bytes_count = self.status.byte_count
+        line = f"[pet] {state} | {bubble} | lines={lines} bytes={bytes_count}"
         with DEBUG_OUTPUT_LOCK:
-            self.stream.write("\r" + line + (" " * padding))
+            if self._rendered:
+                self.stream.write("\r" + (" " * len(line)) + "\r")
+            self.stream.write("\r" + line)
             self.stream.flush()
+            self._rendered = True
+
+    def _clear_rendered_block(self) -> None:
+        if not self.interactive or not self._rendered:
+            return
+        with DEBUG_OUTPUT_LOCK:
+            if self.multiline:
+                origin = self._top_right_origin()
+                if origin is not None:
+                    row, col = origin
+                    blank = " " * self.BOX_WIDTH
+                    self.stream.write("\x1b[s")
+                    for index in range(self.BOX_HEIGHT):
+                        self.stream.write(f"\x1b[{row + index};{col}H{blank}")
+                    self.stream.write("\x1b[u")
+            else:
+                self.stream.write("\r" + (" " * 120) + "\r")
+            self.stream.flush()
+            self._rendered = False
 
 
 class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
@@ -950,6 +1156,7 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                 ping_thread.start()
                 stream_pet = StreamingDebugPet(self.config)
                 stream_pet.start()
+                stream_pet.record_waiting()
 
                 try:
                     message_id = gen_message_id()
@@ -989,11 +1196,12 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
 
                     try:
                         for raw_line in response:
-                            stream_pet.update(raw_line)
+                            stream_pet.record_activity(raw_line)
                             sse_data = extract_sse_data_lines(raw_line)
                             if sse_data is None:
                                 continue
                             if sse_data == "[DONE]":
+                                stream_pet.record_done()
                                 stream_debug_log(
                                     self.config,
                                     stream_pet,
@@ -1027,6 +1235,7 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                                             response,
                                             max(1, self.config.post_finish_grace_timeout),
                                         )
+                                    stream_pet.record_finish_reason(finish_reason)
                                     stream_debug_log(
                                         self.config,
                                         stream_pet,
@@ -1120,6 +1329,7 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                         should_finalize = True
                         if not finish_reason:
                             finish_reason = "stop"
+                        stream_pet.record_timeout()
                         stream_debug_log(
                             self.config,
                             stream_pet,
@@ -1169,6 +1379,7 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
                             "type": "message_stop",
                         },
                     )
+                    stream_pet.record_message_stop()
                     stream_debug_log(self.config, stream_pet, "sent message_stop to client")
                     if timed_out_waiting_for_upstream:
                         stream_debug_log(

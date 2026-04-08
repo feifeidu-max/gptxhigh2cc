@@ -6,7 +6,8 @@ param(
     [int]$Port = 8787,
     [int]$StreamPingInterval = 5,
     [int]$StreamIdleTimeout = 300,
-    [string]$Debug = "1"
+    [string]$Debug = "1",
+    [string]$DebugPet = "auto"
 )
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -39,6 +40,7 @@ $env:CC2OPEN_PORT = "$Port"
 $env:CC2OPEN_STREAM_PING_INTERVAL = "$StreamPingInterval"
 $env:CC2OPEN_STREAM_IDLE_TIMEOUT = "$StreamIdleTimeout"
 $env:CC2OPEN_DEBUG = "$Debug"
+$env:CC2OPEN_DEBUG_PET = "$DebugPet"
 
 Write-Host "Starting cc2open gateway..." -ForegroundColor Cyan
 Write-Host "Base URL: $BaseUrl"
@@ -48,5 +50,6 @@ Write-Host "Port: $Port"
 Write-Host "Stream ping interval: $StreamPingInterval s"
 Write-Host "Stream idle timeout: $StreamIdleTimeout s"
 Write-Host "Debug: $Debug"
+Write-Host "Debug pet: $DebugPet"
 
 python -S $gatewayScript

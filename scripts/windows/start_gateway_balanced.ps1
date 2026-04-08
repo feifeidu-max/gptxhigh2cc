@@ -21,4 +21,5 @@ if (-not (Test-Path $starter)) {
     -Port $Port `
     -StreamPingInterval 4 `
     -StreamIdleTimeout 300 `
-    -Debug "1"
+    -Debug "1" `
+    -DebugPet "auto"
