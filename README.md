@@ -2,24 +2,83 @@
 
 一个最小可运行的本地网关：接收 Anthropic / Claude 风格的 `POST /v1/messages` 请求，转发到 OpenAI 兼容的 `POST /v1/chat/completions`，并始终强制写入本地配置的 `reasoning_effort`。
 
-## 目录结构
+## 30 秒快速启动
+
+推荐直接用现成脚本。
+
+### 1) 进入仓库目录
+
+```powershell
+cd <this-repo>
+```
+
+### 2) 设置 API Key
+
+```powershell
+$env:OPENAI_API_KEY="<YOUR_OPENAI_API_KEY>"
+```
+
+### 3) 直接启动
+
+最强推理：
+
+```powershell
+.\scripts\windows\start_gateway_max.cmd
+```
+
+如果你想更快一些，也可以用：
+
+```powershell
+.\scripts\windows\start_gateway_fast.cmd
+```
+
+### 4) 确认服务起来了
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8787/healthz | Select-Object -ExpandProperty Content
+```
+
+### 5) 把 Claude Code 指到本地网关
+
+把 Anthropic provider 地址改成：
 
 ```text
-.
-├─ src/
-│  └─ cc2open_gateway.py
-├─ scripts/
-│  └─ windows/
-│     ├─ start_gateway.ps1
-│     ├─ start_gateway.cmd
-│     ├─ start_gateway_fast.ps1
-│     ├─ start_gateway_fast.cmd
-│     ├─ start_gateway_balanced.ps1
-│     ├─ start_gateway_balanced.cmd
-│     ├─ start_gateway_max.ps1
-│     └─ start_gateway_max.cmd
-├─ CLAUDE.md
-└─ README.md
+http://127.0.0.1:8787
+```
+
+然后继续按 Anthropic 风格调用 `/v1/messages` 即可。
+
+## 常用启动方式
+
+### 预设脚本
+
+- `start_gateway_fast.cmd` → `reasoning_effort=medium`
+- `start_gateway_balanced.cmd` → `reasoning_effort=high`
+- `start_gateway_max.cmd` → `reasoning_effort=xhigh`
+
+对应文件都在：
+
+```text
+scripts/windows/
+```
+
+这些脚本默认使用：
+
+- `Base URL = https://airouter.service.itstudio.club/v1`
+- `Model = gpt-5.4`
+- `Port = 8787`
+- `stream_idle_timeout = 300`
+- `debug = 1`
+
+如果当前会话里没有 `OPENAI_API_KEY`，`scripts/windows/start_gateway.ps1` 会提示输入。
+
+### 手动直接启动
+
+```powershell
+$env:OPENAI_API_KEY="<YOUR_OPENAI_API_KEY>"
+$env:OPENAI_MODEL="gpt-5.4"
+$env:OPENAI_REASONING_EFFORT="xhigh"
+python .\src\cc2open_gateway.py
 ```
 
 ## 支持的接口
@@ -41,49 +100,25 @@
 python --version
 ```
 
-## 直接启动
+## 目录结构
 
-```powershell
-$env:OPENAI_API_KEY="<YOUR_OPENAI_API_KEY>"
-$env:OPENAI_MODEL="gpt-5.4"
-$env:OPENAI_REASONING_EFFORT="xhigh"
-python .\src\cc2open_gateway.py
+```text
+.
+├─ src/
+│  └─ cc2open_gateway.py
+├─ scripts/
+│  └─ windows/
+│     ├─ start_gateway.ps1
+│     ├─ start_gateway.cmd
+│     ├─ start_gateway_fast.ps1
+│     ├─ start_gateway_fast.cmd
+│     ├─ start_gateway_balanced.ps1
+│     ├─ start_gateway_balanced.cmd
+│     ├─ start_gateway_max.ps1
+│     └─ start_gateway_max.cmd
+├─ CLAUDE.md
+└─ README.md
 ```
-
-## 用启动脚本运行
-
-主启动脚本：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\windows\start_gateway.ps1
-```
-
-三档预设：
-
-```powershell
-.\scripts\windows\start_gateway_fast.cmd
-.\scripts\windows\start_gateway_balanced.cmd
-.\scripts\windows\start_gateway_max.cmd
-```
-
-这些脚本默认使用：
-
-- `Base URL = https://airouter.service.itstudio.club/v1`
-- `Model = gpt-5.4`
-- `Port = 8787`
-
-差异如下：
-
-- `fast` → `reasoning_effort=medium`
-- `balanced` → `reasoning_effort=high`
-- `max` → `reasoning_effort=xhigh`
-
-当前脚本里三档预设还默认开启：
-
-- `stream_idle_timeout = 300`
-- `debug = 1`
-
-如果当前会话里没有 `OPENAI_API_KEY`，`scripts/windows/start_gateway.ps1` 会提示输入。
 
 ## 命令行参数
 
