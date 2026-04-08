@@ -224,7 +224,25 @@ http://127.0.0.1:8787
 
 在启动窗口按：
 
-```text
+```
 Ctrl + C
+```
+
+## 宠物功能
+
+支持宠物模式，可以在启动时开启。宠物功能提供更友好的交互体验。
+
+### 启用宠物功能
+
+在启动脚本中添加 `--pet` 参数：
+
+```powershell
+python .\src\cc2open_gateway.py --pet
+```
+
+或设置环境变量：
+
+```powershell
+$env:CC2OPEN_PET="1"
 ```
 
