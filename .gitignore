@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .claude/
 debug.log
+scripts/windows/.cc2open_state.json

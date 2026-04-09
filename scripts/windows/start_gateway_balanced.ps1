@@ -1,6 +1,6 @@
 param(
     [string]$ApiKey = "",
-    [string]$BaseUrl = "https://airouter.service.itstudio.club/v1",
+    [string]$BaseUrl = "",
     [string]$Model = "gpt-5.4",
     [int]$Port = 8787
 )
@@ -13,13 +13,22 @@ if (-not (Test-Path $starter)) {
     exit 1
 }
 
-& $starter `
-    -ApiKey $ApiKey `
-    -BaseUrl $BaseUrl `
-    -Model $Model `
-    -ReasoningEffort "high" `
-    -Port $Port `
-    -StreamPingInterval 4 `
-    -StreamIdleTimeout 300 `
-    -Debug "1" `
-    -DebugPet "auto"
+$starterArgs = @{
+    Model              = $Model
+    ReasoningEffort    = "high"
+    Port               = $Port
+    StreamPingInterval = 4
+    StreamIdleTimeout  = 300
+    Debug              = "1"
+    DebugPet           = "auto"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ApiKey)) {
+    $starterArgs.ApiKey = $ApiKey
+}
+
+if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
+    $starterArgs.BaseUrl = $BaseUrl
+}
+
+& $starter @starterArgs

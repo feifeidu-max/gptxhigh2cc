@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import sys
+import tempfile
 import unittest
 
 
@@ -130,6 +131,61 @@ class GatewayToolSchemaTests(unittest.TestCase):
         schema = request["tools"][0]["function"]["parameters"]
         self.assertEqual(schema["type"], "object")
         self.assertEqual(schema["required"], ["path"])
+
+
+class GatewayRuntimeConfigTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.gateway = load_gateway_module()
+
+    def make_config(self):
+        return self.gateway.Config(
+            host="127.0.0.1",
+            port=8787,
+            openai_base_url="https://airouter.service.itstudio.club/v1",
+            openai_chat_path="/v1/chat/completions",
+            openai_api_key="test-key-123456",
+            openai_model="gpt-5.4",
+            reasoning_effort="xhigh",
+            timeout_seconds=600,
+            stream_ping_interval=5,
+            stream_idle_timeout=15,
+            post_finish_grace_timeout=5,
+            debug=False,
+            debug_pet="0",
+        )
+
+    def test_runtime_store_updates_and_persists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = pathlib.Path(temp_dir) / ".cc2open_state.json"
+            store = self.gateway.RuntimeConfigStore(self.make_config(), state_path)
+
+            updated = store.update(
+                openai_base_url="https://geek.tm2.xin/v1/",
+                openai_api_key="sk-new-abcdef",
+            )
+
+            self.assertEqual(updated.openai_base_url, "https://geek.tm2.xin/v1")
+            self.assertEqual(updated.openai_api_key, "sk-new-abcdef")
+
+            saved = self.gateway.json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["openai_base_url"], "https://geek.tm2.xin/v1")
+            self.assertEqual(saved["openai_api_key"], "sk-new-abcdef")
+
+    def test_parse_runtime_command_supports_url_and_apikey(self):
+        self.assertEqual(
+            self.gateway.parse_runtime_command("url https://geek.tm2.xin/v1"),
+            ("url", "https://geek.tm2.xin/v1"),
+        )
+        self.assertEqual(
+            self.gateway.parse_runtime_command("set apikey sk-abc"),
+            ("apikey", "sk-abc"),
+        )
+        self.assertEqual(self.gateway.parse_runtime_command("show"), ("show", None))
+        self.assertEqual(
+            self.gateway.parse_runtime_command("something else"),
+            ("unknown", "something else"),
+        )
 
 
 if __name__ == "__main__":

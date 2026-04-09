@@ -13,8 +13,9 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -41,6 +42,10 @@ DEFAULT_STREAM_IDLE_TIMEOUT = 15
 DEFAULT_POST_FINISH_GRACE_TIMEOUT = 5
 SERVER_NAME = "cc2open-gateway"
 CLIENT_DISCONNECT_WINERRORS = {10053, 10054}
+DEFAULT_STATE_FILENAME = ".cc2open_state.json"
+RUNTIME_COMMAND_HELP = (
+    "Runtime commands: url <base_url> | apikey <api_key> | show | help"
+)
 
 
 class ClientDisconnectedError(Exception):
@@ -77,6 +82,172 @@ class Config:
 def env_or_default(name: str, default: str | None = None) -> str | None:
     value = os.environ.get(name)
     return value if value not in (None, "") else default
+
+
+def normalize_base_url(value: str) -> str:
+    normalized = value.strip().rstrip("/")
+    if normalized.endswith(DEFAULT_OPENAI_CHAT_PATH):
+        normalized = normalized[: -len(DEFAULT_OPENAI_CHAT_PATH)]
+    elif normalized.endswith("/chat/completions"):
+        normalized = normalized[: -len("/chat/completions")]
+    return normalized.rstrip("/")
+
+
+def mask_secret(value: str, keep: int = 4) -> str:
+    if len(value) <= keep * 2:
+        return "*" * len(value)
+    return f"{value[:keep]}...{value[-keep:]}"
+
+
+def resolve_state_path() -> Path:
+    configured = env_or_default("CC2OPEN_STATE_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parents[1] / "scripts" / "windows" / DEFAULT_STATE_FILENAME
+
+
+def save_runtime_state(state_path: Path, config: Config) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "openai_api_key": config.openai_api_key,
+        "openai_base_url": config.openai_base_url,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    state_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+class RuntimeConfigStore:
+    def __init__(self, initial_config: Config, state_path: Path) -> None:
+        self._lock = threading.RLock()
+        self._config = initial_config
+        self.state_path = state_path
+
+    def get(self) -> Config:
+        with self._lock:
+            return self._config
+
+    def persist(self) -> None:
+        with self._lock:
+            save_runtime_state(self.state_path, self._config)
+
+    def update(
+        self,
+        *,
+        openai_base_url: str | None = None,
+        openai_api_key: str | None = None,
+    ) -> Config:
+        with self._lock:
+            new_config = replace(
+                self._config,
+                openai_base_url=(
+                    normalize_base_url(openai_base_url)
+                    if openai_base_url is not None
+                    else self._config.openai_base_url
+                ),
+                openai_api_key=(
+                    openai_api_key.strip()
+                    if openai_api_key is not None
+                    else self._config.openai_api_key
+                ),
+            )
+            self._config = new_config
+            save_runtime_state(self.state_path, new_config)
+            return new_config
+
+
+def print_console_line(message: str) -> None:
+    with DEBUG_OUTPUT_LOCK:
+        print(message, flush=True)
+
+
+def print_runtime_summary(config: Config) -> None:
+    print_console_line(f"Active Base URL: {config.openai_base_url}")
+    print_console_line(f"Active upstream URL: {config.upstream_url}")
+    print_console_line(f"Active API key: {mask_secret(config.openai_api_key)}")
+
+
+def parse_runtime_command(raw: str) -> tuple[str, str | None] | None:
+    command = raw.strip()
+    if not command:
+        return None
+
+    lowered = command.lower()
+    if lowered in {"help", "?"}:
+        return ("help", None)
+    if lowered in {"show", "status"}:
+        return ("show", None)
+
+    for prefix in ("url ", "set url ", "baseurl ", "set baseurl "):
+        if lowered.startswith(prefix):
+            return ("url", command[len(prefix) :].strip())
+
+    for prefix in ("apikey ", "set apikey ", "key ", "set key "):
+        if lowered.startswith(prefix):
+            return ("apikey", command[len(prefix) :].strip())
+
+    return ("unknown", command)
+
+
+def runtime_command_loop(runtime_config: RuntimeConfigStore) -> None:
+    stdin = sys.stdin
+    if stdin is None or not hasattr(stdin, "readline"):
+        return
+    if hasattr(stdin, "isatty") and not stdin.isatty():
+        return
+
+    print_console_line(RUNTIME_COMMAND_HELP)
+    while True:
+        try:
+            raw = stdin.readline()
+        except Exception as exc:
+            print_console_line(f"Runtime command loop stopped: {exc}")
+            return
+
+        if raw == "":
+            return
+
+        parsed = parse_runtime_command(raw)
+        if parsed is None:
+            continue
+
+        action, value = parsed
+        if action == "help":
+            print_console_line(RUNTIME_COMMAND_HELP)
+            continue
+        if action == "show":
+            print_runtime_summary(runtime_config.get())
+            continue
+        if action == "url":
+            if not value:
+                print_console_line("Usage: url <base_url>")
+                continue
+            try:
+                config = runtime_config.update(openai_base_url=value)
+            except Exception as exc:
+                print_console_line(f"Failed to update Base URL: {exc}")
+                continue
+            print_console_line(f"Base URL updated: {config.openai_base_url}")
+            print_console_line(f"New requests will use: {config.upstream_url}")
+            continue
+        if action == "apikey":
+            if not value:
+                print_console_line("Usage: apikey <api_key>")
+                continue
+            try:
+                config = runtime_config.update(openai_api_key=value)
+            except Exception as exc:
+                print_console_line(f"Failed to update API key: {exc}")
+                continue
+            print_console_line(
+                f"API key updated: {mask_secret(config.openai_api_key)}"
+            )
+            continue
+
+        print_console_line(f"Unknown command: {value}")
+        print_console_line(RUNTIME_COMMAND_HELP)
 
 
 def parse_args() -> Config:
@@ -1167,7 +1338,23 @@ class ClaudeToOpenAIHandler(BaseHTTPRequestHandler):
 
     @property
     def config(self) -> Config:
+        request_config = getattr(self, "_request_config", None)
+        if request_config is not None:
+            return request_config
+        runtime_config = getattr(self.server, "runtime_config", None)
+        if runtime_config is not None:
+            return runtime_config.get()
         return self.server.config  # type: ignore[attr-defined]
+
+    def handle_one_request(self) -> None:
+        runtime_config = getattr(self.server, "runtime_config", None)
+        if runtime_config is not None:
+            self._request_config = runtime_config.get()
+        try:
+            super().handle_one_request()
+        finally:
+            if hasattr(self, "_request_config"):
+                delattr(self, "_request_config")
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(
@@ -1778,22 +1965,37 @@ class GracefulThreadingHTTPServer(ThreadingHTTPServer):
 
 def main() -> int:
     config = parse_args()
+    runtime_config = RuntimeConfigStore(config, resolve_state_path())
+    try:
+        runtime_config.persist()
+    except Exception as exc:
+        print_console_line(f"Warning: failed to persist runtime settings: {exc}")
+
     server = GracefulThreadingHTTPServer((config.host, config.port), ClaudeToOpenAIHandler)
     server.config = config  # type: ignore[attr-defined]
+    server.runtime_config = runtime_config  # type: ignore[attr-defined]
 
-    print(
+    print_console_line(
         f"{SERVER_NAME} listening on http://{config.host}:{config.port} -> {config.upstream_url}"
     )
-    print(
+    print_console_line(
         f"OpenAI model override: {config.openai_model or '<use incoming model>'}; "
         f"forced reasoning_effort={config.reasoning_effort}"
     )
-    print("Press Ctrl+C to stop.")
+    print_console_line("Press Ctrl+C to stop.")
+
+    command_thread = threading.Thread(
+        target=runtime_command_loop,
+        args=(runtime_config,),
+        name="cc2open-runtime-commands",
+        daemon=True,
+    )
+    command_thread.start()
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print_console_line("\nShutting down...")
     finally:
         server.server_close()
 
