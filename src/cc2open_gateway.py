@@ -427,11 +427,6 @@ def build_openai_tools(
             continue
         tool_name = str(tool["name"])
         input_schema = tool.get("input_schema")
-        debug_log(
-            config,
-            "incoming tool "
-            f"{tool_name}: has_input_schema={isinstance(input_schema, dict)}",
-        )
         parameters, schema_status = normalize_openai_function_schema(tool_name, input_schema)
         if parameters is None:
             debug_log(
@@ -439,10 +434,13 @@ def build_openai_tools(
                 f"skipping tool {tool_name}: schema_status={schema_status}",
             )
             continue
-        debug_log(
-            config,
-            f"forwarding tool {tool_name}: schema_status={schema_status}",
-        )
+        if schema_status != "preserved":
+            debug_log(
+                config,
+                "normalizing tool "
+                f"{tool_name}: has_input_schema={isinstance(input_schema, dict)} "
+                f"schema_status={schema_status}",
+            )
         tools.append(
             {
                 "type": "function",
